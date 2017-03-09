@@ -1,6 +1,7 @@
 local env = require 'resty.env'
 local custom_config = env.get('APICAST_CUSTOM_CONFIG')
 local configuration_store = require 'configuration_store'
+local util = require('util')
 
 local oauth = require 'oauth'
 local resty_url = require 'resty.url'
@@ -14,12 +15,17 @@ local concat = table.concat
 local gsub = string.gsub
 local tonumber = tonumber
 local setmetatable = setmetatable
-local exit = ngx.exit
 local encode_args = ngx.encode_args
 local resty_resolver = require 'resty.resolver'
+local semaphore = require('ngx.semaphore')
+local backend_client = require('backend_client')
+local timers = semaphore.new(tonumber(env.get('APICAST_REPORTING_THREADS') or 0))
+
 local empty = {}
 
 local response_codes = env.enabled('APICAST_RESPONSE_CODES')
+
+local post_action_needed = response_codes or timers:count() < 1
 
 local _M = { }
 
@@ -134,7 +140,7 @@ local http = {
     local backend_upstream = ngx.ctx.backend_upstream
     local previous_real_url = ngx.var.real_url
     ngx.log(ngx.DEBUG, '[ctx] copying backend_upstream of size: ', #backend_upstream)
-    local res = ngx.location.capture(assert(url), { share_all_vars = true, ctx = { backend_upstream = backend_upstream } })
+    local res = ngx.location.capture(assert(url), { share_all_vars = true, ctx = { backend_upstream = backend_upstream, backend_endpoint = ngx.var.backend_endpoint } })
 
     local real_url = ngx.var.real_url
 
@@ -150,7 +156,7 @@ local http = {
   end
 }
 
-local function oauth_authrep(service)
+local function oauth_authrep(proxy, service)
   local cached_key = ngx.var.cached_key .. ":" .. ngx.var.usage
   local access_tokens = assert(ngx.shared.api_keys, 'missing shared dictionary: api_keys')
   local is_known = access_tokens:get(cached_key)
@@ -159,6 +165,7 @@ local function oauth_authrep(service)
     ngx.log(ngx.DEBUG, 'apicast cache hit key: ', cached_key)
     ngx.var.cached_key = cached_key
   else
+    proxy:set_backend_upstream(service)
     local res = http.get("/threescale_oauth_authrep")
 
     if res.status ~= 200   then
@@ -174,7 +181,7 @@ local function oauth_authrep(service)
   end
 end
 
-local function authrep(service)
+local function authrep(proxy, service)
   -- NYI: return to lower frame
   local cached_key = ngx.var.cached_key .. ":" .. ngx.var.usage
   local api_keys = ngx.shared.api_keys
@@ -184,6 +191,8 @@ local function authrep(service)
     ngx.log(ngx.DEBUG, 'apicast cache hit key: ', cached_key)
     ngx.var.cached_key = cached_key
   else
+
+    proxy:set_backend_upstream(service)
     ngx.log(ngx.INFO, 'apicast cache miss key: ', cached_key)
     local res = http.get("/threescale_authrep")
 
@@ -206,11 +215,15 @@ local function authrep(service)
   end
 end
 
-function _M.authorize(backend_version, service)
+function _M:authorize(backend_version, service)
   if backend_version == 'oauth' then
-    oauth_authrep(service)
+    oauth_authrep(self, service)
   else
-    authrep(service)
+    authrep(self, service)
+  end
+
+  if not post_action_needed then
+    self:post_action(true)
   end
 end
 
@@ -275,8 +288,6 @@ end
 function _M:call(host)
   host = host or ngx.var.host
   local service = ngx.ctx.service or self:set_service(host)
-
-  self:set_backend_upstream(service)
 
   if service.backend_version == 'oauth' then
     local f, params = oauth.call()
@@ -349,25 +360,86 @@ function _M:access(service)
     ngx.header["X-3scale-hostname"]      = ngx.var.hostname
   end
 
-  self.authorize(backend_version, service)
+  self:authorize(backend_version, service)
 end
 
-
-local function response_codes_encoded_data()
+local function response_codes_data()
   local params = {}
 
   if not response_codes then
-    return ''
+    return params
   end
 
   if response_codes then
     params["log[code]"] = ngx.var.status
   end
 
-  return ngx.escape_uri(ngx.encode_args(params))
+  return params
 end
 
-function _M:post_action()
+local function response_codes_encoded_data()
+  return ngx.escape_uri(ngx.encode_args(response_codes_data()))
+end
+
+local function handle_post_action_response(cached_key, res)
+  if res.ok == false or res.status ~= 200 then
+    local api_keys = ngx.shared.api_keys
+
+    if api_keys then
+      ngx.log(ngx.NOTICE, 'apicast cache delete key: ', cached_key, ' cause status ', res.status)
+      api_keys:delete(cached_key)
+    else
+      ngx.log(ngx.ALERT, 'apicast cache error missing shared memory zone api_keys')
+    end
+
+    ngx.log(ngx.ERR, 'http_client error: ', res.error, ' status: ', res.status)
+  end
+end
+
+local function post_action(_, cached_key, backend, ...)
+  local res = util.timer('backend post_action', backend.authrep, backend, ...)
+
+  handle_post_action_response(cached_key, res)
+
+  if not post_action_needed then
+    timers:post(1)
+  end
+end
+
+local function capture_post_action(self, cached_key, service)
+  self:set_backend_upstream(service)
+
+  local auth_uri = service.backend_version == 'oauth' and 'threescale_oauth_authrep' or 'threescale_authrep'
+  local res = http.get("/".. auth_uri .."?log=" .. response_codes_encoded_data())
+
+  handle_post_action_response(cached_key, res)
+end
+
+local function timer_post_action(self, cached_key, service)
+  local backend = assert(backend_client:new(service), 'missing backend')
+
+  local ok, err
+
+  if post_action_needed then
+    ok = true
+  else
+    ok, err = timers:wait(10)
+  end
+
+  if ok then
+    -- TODO: try to do this in different phase and use semaphore to limit number of background threads
+    -- TODO: Also it is possible to use sets in shared memory to enqueue work
+    ngx.timer.at(0, post_action, cached_key, backend, ngx.ctx.usage, ngx.ctx.credentials, response_codes_data())
+  else
+    ngx.log(ngx.ERR, 'failed to acquire timer: ', err)
+    return capture_post_action(self, cached_key, service)
+  end
+end
+
+function _M:post_action(force)
+  if not post_action_needed and not force then
+    return nil, 'post action not needed'
+  end
 
   local cached_key = ngx.var.cached_key
 
@@ -376,26 +448,15 @@ function _M:post_action()
 
     local service_id = ngx.var.service_id
     local service = ngx.ctx.service or self.configuration:find_by_id(service_id)
-    self:set_backend_upstream(service)
 
-    local auth_uri = service.backend_version == 'oauth' and 'threescale_oauth_authrep' or 'threescale_authrep'
-    local res = http.get("/".. auth_uri .."?log=" .. response_codes_encoded_data())
-
-    if res.status ~= 200 then
-      local api_keys = ngx.shared.api_keys
-
-      if api_keys then
-        ngx.log(ngx.NOTICE, 'apicast cache delete key: ', cached_key, ' cause status ', res.status)
-        api_keys:delete(cached_key)
-      else
-        ngx.log(ngx.ALERT, 'apicast cache error missing shared memory zone api_keys')
-      end
+    if post_action_needed then
+      capture_post_action(self, cached_key, service)
+    else
+      timer_post_action(self, cached_key, service)
     end
   else
     ngx.log(ngx.INFO, '[async] skipping after action, no cached key')
   end
-
-  exit(ngx.HTTP_OK)
 end
 
 if custom_config then

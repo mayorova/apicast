@@ -132,3 +132,14 @@ You should enable the debug level only for debugging.
 Replace `${ID}` with the actual Service ID. The value should be the configuration version you can see in the configuration history on the Admin Portal.
 
 Setting it to particual version will make it not auto-update and always use that version.
+
+### `APICAST_REPORTING_THREADS`
+
+**Default**: 0
+**Value:**: integer >= 0
+
+Value greater than 0 is going to enable out-of-band reporting to backend.
+This is new **experimental** feature for increasing performance. Client
+Won't see the backend latency and everything will be processed asynchronously.
+This value determines how many asynchronous reports can be running simultainesly
+before client starts being throttled by adding latency.

@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Backend HTTP client that uses cosockets [PR #295](https://github.com/3scale/apicast/pull/295)
 - Ability to customize main section of nginx configuration (and expose more env variables) [PR #292](https://github.com/3scale/apicast/pull/292)
 - Ability to lock service to specific configuration version [PR #293](https://github.com/3scale/apicast/pull/292)
-- Experimental option for true out of band reporting (`APICAST_REPORTING_WORKERS`) [PR #290](https://github.com/3scale/apicast/pull/290)
+- Experimental option for true out of band reporting (`APICAST_REPORTING_THREADS`) [PR #290](https://github.com/3scale/apicast/pull/290)
 - `/status/info` endpoint to the Management API [PR #290](https://github.com/3scale/apicast/pull/290)
 
 ### Removed

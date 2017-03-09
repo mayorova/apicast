@@ -65,18 +65,26 @@ end
 
 function _M.post_action()
   local request_id = ngx.var.original_request_id
-  local p = post_action_proxy[request_id]
-  post_action_proxy[request_id] = nil
-  p:post_action()
+  local p = ngx.ctx.proxy or post_action_proxy[request_id]
+
+  if p then
+    p:post_action()
+  else
+    ngx.log(ngx.WARN, 'could not find proxy for request id: ', request_id)
+  end
 end
 
 function _M.access()
   local p = ngx.ctx.proxy
-  local fun = p:call() -- proxy:access() or oauth handler
   local request_id = ngx.var.request_id
+  local fun = p:call() -- proxy:access() or oauth handler
+
+  local ok, err = fun()
+
   post_action_proxy[request_id] = p
   ngx.var.original_request_id = request_id
-  return fun()
+
+  return ok, err
 end
 
 _M.body_filter = noop
